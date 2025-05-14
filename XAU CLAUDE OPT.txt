@@ -1,0 +1,997 @@
+//+------------------------------------------------------------------+
+//| Signal logic                                                     |
+//+------------------------------------------------------------------+
+double GetMLSignal(int cmd)
+{
+    // Calculate weighted sum of features
+    double signal = 0;
+    for(int i = 0; i < MLFeatureCount; i++) {
+        signal += g_ml_features[0][i] * g_ml_weights[i];
+    }
+
+    // Apply sigmoid activation function
+    signal = 1.0 / (1.0 + MathExp(-signal));
+
+    // Apply market regime adjustments - BALANCED for both BUY and SELL
+    switch(g_market_regime) {
+        case REGIME_TRENDING_UP:
+            if(cmd == OP_BUY) signal *= 1.2;
+            else signal *= 0.8; // Reduced multiplier for SELL in uptrend
+            break;
+        case REGIME_TRENDING_DOWN:
+            if(cmd == OP_SELL) signal *= 1.2; // Balanced multiplier (reduced from 1.3)
+            else signal *= 0.8; // Reduced multiplier for BUY in downtrend
+            break;
+        case REGIME_VOLATILE:
+            if(cmd == OP_SELL) signal *= 1.1; // Slight preference for SELL in volatile markets
+            else signal *= 1.0;
+            break;
+        case REGIME_RANGING:
+            // No special treatment in ranging markets
+            break;
+    }
+    
+    // Apply market cycle adjustments
+    switch(g_market_cycle) {
+        case CYCLE_ACCUMULATION:
+            if(cmd == OP_BUY) signal *= 1.1;
+            break;
+        case CYCLE_MARKUP:
+            if(cmd == OP_BUY) signal *= 1.2;
+            else signal *= 0.9;
+            break;
+        case CYCLE_DISTRIBUTION:
+            if(cmd == OP_SELL) signal *= 1.1;
+            break;
+        case CYCLE_MARKDOWN:
+            if(cmd == OP_SELL) signal *= 1.2;
+            else signal *= 0.9;
+            break;
+    }
+    
+    // Apply gold-specific indicator adjustments
+    if(UseUSDCorrelation && g_usd_index_correlation < -0.5) {
+        // Strong negative USD correlation favors gold BUY
+        if(cmd == OP_BUY) signal *= 1.1;
+    }
+    else if(UseUSDCorrelation && g_usd_index_correlation > 0.5) {
+        // Strong positive USD correlation favors gold SELL
+        if(cmd == OP_SELL) signal *= 1.1;
+    }
+    
+    // Session-based adjustments
+    if(g_in_optimal_session) {
+        signal *= 1.1; // Higher confidence during optimal sessions
+    }
+    
+    return signal;
+}
+
+//+------------------------------------------------------------------+
+//| Adaptive ML weight adjustment                                    |
+//+------------------------------------------------------------------+
+void AdaptMLWeights(int cmd, double outcome)
+{
+    double prediction = GetMLSignal(cmd);
+    double error = outcome - prediction;
+    double learning_rate = 0.01;
+    
+    // Update weights based on prediction error
+    for(int i = 0; i < MLFeatureCount; i++) {
+        g_ml_weights[i] += learning_rate * error * g_ml_features[0][i];
+    }
+    
+    // Track feature importance based on weight magnitude
+    UpdateFeatureImportance();
+}
+
+//+------------------------------------------------------------------+
+//| Update feature importance ranking                                |
+//+------------------------------------------------------------------+
+void UpdateFeatureImportance()
+{
+    // Create temporary array to store weight magnitudes
+    double weight_magnitude[15];
+    for(int i = 0; i < MLFeatureCount; i++) {
+        weight_magnitude[i] = MathAbs(g_ml_weights[i]);
+    }
+    
+    // Simple bubble sort to rank features by importance
+    for(int i = 0; i < MLFeatureCount; i++) {
+        for(int j = i + 1; j < MLFeatureCount; j++) {
+            if(weight_magnitude[i] < weight_magnitude[j]) {
+                // Swap magnitudes
+                double temp_mag = weight_magnitude[i];
+                weight_magnitude[i] = weight_magnitude[j];
+                weight_magnitude[j] = temp_mag;
+                
+                // Swap indices
+                int temp_idx = g_ml_feature_importance[i];
+                g_ml_feature_importance[i] = g_ml_feature_importance[j];
+                g_ml_feature_importance[j] = temp_idx;
+            }
+        }
+    }
+}
+
+//+------------------------------------------------------------------+
+//| Normalize Value                                                  |
+//+------------------------------------------------------------------+
+double NormalizeValue(double value)
+{
+    // Improved normalization function to handle extremes better
+    if(MathAbs(value) < 0.00001) return 0; // Avoid division by zero
+    
+    // Dynamic normalization based on recent extremes
+    static double max_seen = 50.0;
+    static double min_seen = -50.0;
+    
+    // Update extremes if needed
+    if(value > max_seen) max_seen = value;
+    if(value < min_seen) min_seen = value;
+    
+    // Keep bounds reasonable
+    max_seen = MathMin(max_seen, 1000.0);
+    min_seen = MathMax(min_seen, -1000.0);
+    
+    // Normalize to [-1, 1] range
+    double range = max_seen - min_seen;
+    if(range < 0.00001) return 0;
+    
+    double norm = 2.0 * ((value - min_seen) / range) - 1.0;
+    return MathMax(-1.0, MathMin(1.0, norm));
+}
+
+//+------------------------------------------------------------------+
+//| Other Helper Functions                                           |
+//+------------------------------------------------------------------+
+bool IsNewBar()
+{
+    static datetime last_bar_time = 0;
+    datetime current_bar_time = iTime(Symbol(), PrimaryTimeframe, 0);
+
+    if(current_bar_time != last_bar_time) {
+        last_bar_time = current_bar_time;
+        return true;
+    }
+    return false;
+}
+
+bool IsDayChanged()
+{
+    static datetime last_day = 0;
+    datetime current_time = TimeCurrent();
+
+    if(TimeDay(current_time) != TimeDay(last_day)) {
+        last_day = current_time;
+        return true;
+    }
+    return false;
+}
+
+void ResetDailyValues()
+{
+    g_daily_risk_used = 0;
+    g_news_filter_active = false;
+    
+    // Log daily performance 
+    double current_balance = AccountBalance();
+    double daily_profit = current_balance - g_peak_balance;
+    
+    if(current_balance > g_peak_balance) {
+        g_peak_balance = current_balance;
+    }
+    
+    // Reset consecutive losses if profitable day
+    if(daily_profit > 0) {
+        g_consecutive_losses = 0;
+    }
+    
+    Print("Daily values reset. Balance: ", current_balance, 
+          " Daily P/L: ", daily_profit);
+}
+
+bool CheckTradeAllowed()
+{
+    // Basic trading permission checks
+    if(!IsTradeAllowed()) {
+        Print("Trading not allowed by terminal");
+        return false;
+    }
+    
+    if(IsTradeContextBusy()) {
+        Print("Trade context busy");
+        return false;
+    }
+    
+    // Check daily risk limit
+    if(g_daily_risk_used >= MaxDailyRisk) {
+        Print("Daily risk limit reached: ", g_daily_risk_used, "/", MaxDailyRisk);
+        return false;
+    }
+    
+    // Check spread
+    double spread = MarketInfo(Symbol(), MODE_SPREAD);
+    if(spread > MaxSpread) {
+        Print("Spread too high: ", spread, " > ", MaxSpread);
+        return false;
+    }
+    
+    // Check consecutive losses safety
+    if(g_consecutive_losses >= MaxConsecutiveLosses) {
+        Print("Max consecutive losses reached (", g_consecutive_losses, "). Trading paused.");
+        return false;
+    }
+    
+    // Check drawdown limit
+    double drawdown = (1 - AccountEquity() / g_peak_balance) * 100;
+    if(drawdown > MaxDrawdownPercent) {
+        Print("Maximum drawdown reached: ", DoubleToString(drawdown, 2), 
+              "% > ", MaxDrawdownPercent, "%");
+        return false;
+    }
+    
+    // Check if we're in allowed trading session
+    if(FilterBySession && !g_in_optimal_session) {
+        return false;
+    }
+    
+    return true;
+}
+
+int CountOpenPositions()
+{
+    int count = 0;
+    for(int i = 0; i < OrdersTotal(); i++) {
+        if(OrderSelect(i, SELECT_BY_POS, MODE_TRADES)) {
+            if(OrderSymbol() == Symbol() && OrderMagicNumber() == MAGIC_NUMBER) {
+                count++;
+            }
+        }
+    }
+    return count;
+}
+
+void LogTradeExecution(int cmd, double lots, double entry, double sl, double tp)
+{
+    string direction = (cmd == OP_BUY) ? "BUY" : "SELL";
+    Print("=== Trade Execution ===");
+    Print("Direction: ", direction);
+    Print("Lots: ", DoubleToString(lots, 2));
+    Print("Entry: ", DoubleToString(entry, Digits));
+    Print("Stop Loss: ", DoubleToString(sl, Digits));
+    Print("Take Profit: ", DoubleToString(tp, Digits));
+    Print("Market Regime: ", g_market_regime);
+    Print("Market Cycle: ", g_market_cycle);
+    Print("USD Correlation: ", g_usd_index_correlation);
+    Print("Top ML Feature: ", g_ml_feature_importance[0]);
+    Print("Signal Strength: ", GetMLSignal(cmd));
+    Print("=====================");
+}
+
+//+------------------------------------------------------------------+
+//| Order History Analysis                                           |
+//+------------------------------------------------------------------+
+void AnalyzePastTrades()
+{
+    int total_trades = 0;
+    int winning_trades = 0;
+    int losing_trades = 0;
+    double total_profit = 0;
+    double total_loss = 0;
+    int buy_count = 0;
+    int sell_count = 0;
+    
+    // Loop through closed orders
+    for(int i = 0; i < OrdersHistoryTotal(); i++) {
+        if(OrderSelect(i, SELECT_BY_POS, MODE_HISTORY)) {
+            if(OrderSymbol() == Symbol() && OrderMagicNumber() == MAGIC_NUMBER) {
+                total_trades++;
+                
+                if(OrderProfit() > 0) {
+                    winning_trades++;
+                    total_profit += OrderProfit();
+                } else {
+                    losing_trades++;
+                    total_loss += OrderProfit();
+                }
+                
+                if(OrderType() == OP_BUY) {
+                    buy_count++;
+                } else if(OrderType() == OP_SELL) {
+                    sell_count++;
+                }
+            }
+        }
+    }
+    
+    // Only print if we have trades
+    if(total_trades > 0) {
+        double win_percent = (double)winning_trades / total_trades * 100;
+        double profit_factor = (total_loss != 0) ? MathAbs(total_profit / total_loss) : 0;
+        
+        Print("=== Trading Statistics ===");
+        Print("Total Trades: ", total_trades);
+        Print("Win Rate: ", DoubleToString(win_percent, 2), "%");
+        Print("Profit Factor: ", DoubleToString(profit_factor, 2));
+        Print("Buy/Sell Ratio: ", buy_count, "/", sell_count);
+        Print("==========================");
+    }
+}
+
+//+------------------------------------------------------------------+
+//| Expert deinitialization function                                 |
+//+------------------------------------------------------------------+
+void OnDeinit(const int reason)
+{
+    Print("XAU/USD Advanced EA ML v3.00 shutting down. Reason: ", reason);
+    AnalyzePastTrades();
+}
+
+//+------------------------------------------------------------------+
+//|                                        XAU_USD_Advanced_EA.mq4     |
+//|                                Copyright 2025, Strabogianno        |
+//|                            Last Updated: 2025-05-14                |
+//+------------------------------------------------------------------+
+#property copyright "Copyright 2025, Strabogianno"
+#property link      ""
+#property version   "3.00"
+#property strict
+
+#define MAGIC_NUMBER 20250514
+#define EA_NAME "XAU/USD Advanced EA ML"
+
+// Initial Account Settings
+#define INITIAL_BALANCE 4000.0   // Starting balance in EUR
+#define MAX_INITIAL_LOTS 0.20    // Maximum starting lots for 4000 EUR
+
+// External Parameters
+extern string S1 = "=== Risk Management Settings ===";
+extern double RiskPercent = 2.0;           
+extern double MaxDailyRisk = 6.0;          
+extern double MaxSpread = 35;              
+extern int MaxPositions = 1;               
+extern int MaxConsecutiveLosses = 3;       // New: Stop trading after consecutive losses
+extern double MaxDrawdownPercent = 10.0;   // New: Maximum allowed drawdown percentage
+
+extern string S2 = "=== Timeframe Settings ===";
+extern ENUM_TIMEFRAMES PrimaryTimeframe = PERIOD_H1;
+extern ENUM_TIMEFRAMES LongTermTimeframe = PERIOD_H4; // New: For better trend confirmation
+
+extern string S3 = "=== Trading Sessions ===";
+extern bool FilterBySession = true;         
+extern bool TradeAsianSession = true;       
+extern bool TradeLondonSession = true;      
+extern bool TradeNewYorkSession = true;     
+extern bool PrioritizeUSAsianOverlap = true; // New: Focus on optimal gold trading hours
+
+extern string S4 = "=== Stop Management ===";
+extern bool UseBreakEven = true;           
+extern double BreakEvenActivation = 1.2;    // Reduced from 1.5
+extern double BreakEvenProfit = 0.5;        
+extern bool UseTrailingStop = true;         
+extern double TrailingActivation = 1.5;     // Reduced from 2.0
+extern double TrailingDistance = 0.8;       // Reduced from 1.0
+
+extern string S5 = "=== Take Profit Settings ==="; // New section
+extern bool UseMultipleTPs = true;          // New: Use multiple take profit levels
+extern double TP1Percent = 30.0;            // New: Percentage of position to close at TP1
+extern double TP2Percent = 40.0;            // New: Percentage of position to close at TP2
+extern double TP3Percent = 30.0;            // New: Percentage of position to close at TP3
+extern double TP1Ratio = 1.0;               // New: TP1 distance as ratio of SL
+extern double TP2Ratio = 1.5;               // New: TP2 distance as ratio of SL
+extern double TP3Ratio = 2.0;               // New: TP3 distance as ratio of SL
+
+extern string S6 = "=== Trade Direction Settings ==="; // New section
+extern bool AllowBuyTrades = true;          // New: Enable/disable buy trades
+extern bool AllowSellTrades = true;         // New: Enable/disable sell trades
+extern double BuySignalMultiplier = 1.0;    // New: Buy signal adjustment
+extern double SellSignalMultiplier = 1.0;   // New: Sell signal adjustment
+
+extern string S7 = "=== ML Parameters ===";
+extern int MLWindowSize = 60;               // Increased from 50
+extern int MLTrainingPeriod = 750;          // Increased from 500
+extern double MLConfidenceThreshold = 0.68; // Decreased from 0.75 for more signals
+extern bool EnableMLAdaptation = true;
+extern int MLFeatureCount = 15;             // Increased from 10 features to 15
+
+extern string S8 = "=== Gold-Specific Features ==="; // New section
+extern bool UseUSDCorrelation = true;       // New: Track USD correlation
+extern bool UseEquityMarketSentiment = true; // New: Track equity market sentiment
+extern bool UseVolumeProfiling = true;      // New: Track volume profiles
+
+// Global Variables
+double g_last_atr;
+datetime g_last_trade_time;
+double g_daily_risk_used;
+bool g_news_filter_active;
+int g_consecutive_losses;
+double g_peak_balance;
+double g_max_drawdown;
+datetime g_last_daily_reset;
+double g_usd_index_correlation;
+double g_equity_sentiment;
+double g_volume_profile;
+
+// ML Feature Arrays - Expanded to 15 features
+double g_ml_features[][15];
+double g_ml_labels[];
+double g_ml_weights[15];
+int g_ml_feature_importance[15];
+
+// Market State Enums
+enum ENUM_MARKET_REGIME {
+    REGIME_TRENDING_UP,
+    REGIME_TRENDING_DOWN,
+    REGIME_RANGING,
+    REGIME_VOLATILE
+};
+
+enum ENUM_MARKET_CYCLE {
+    CYCLE_ACCUMULATION,
+    CYCLE_MARKUP,
+    CYCLE_DISTRIBUTION,
+    CYCLE_MARKDOWN
+};
+
+// Market State Variables
+ENUM_MARKET_REGIME g_market_regime;
+ENUM_MARKET_CYCLE g_market_cycle;
+double g_regime_strength;
+double g_cycle_progress;
+bool g_in_optimal_session;
+
+//+------------------------------------------------------------------+
+//| Expert initialization function                                   |
+//+------------------------------------------------------------------+
+int OnInit()
+{
+    // Initialize ML arrays with expanded feature set
+    ArrayResize(g_ml_features, MLWindowSize);
+    ArrayResize(g_ml_labels, MLWindowSize);
+    
+    // Initialize ML weights with small random values
+    for(int i = 0; i < MLFeatureCount; i++) {
+        g_ml_weights[i] = 0.1 * (MathRand() / 32768.0 - 0.5);
+        g_ml_feature_importance[i] = i; // Initial ordering of features
+    }
+
+    // Initialize global variables
+    g_last_trade_time = 0;
+    g_daily_risk_used = 0;
+    g_news_filter_active = false;
+    g_consecutive_losses = 0;
+    g_peak_balance = AccountBalance();
+    g_max_drawdown = 0;
+    g_last_daily_reset = 0;
+    g_usd_index_correlation = 0;
+    g_equity_sentiment = 0;
+    g_volume_profile = 0;
+    g_in_optimal_session = false;
+
+    Print("XAU/USD Advanced EA ML v3.00 initialized");
+    Print("Buy trades enabled: ", AllowBuyTrades);
+    Print("Sell trades enabled: ", AllowSellTrades);
+
+    return(INIT_SUCCEEDED);
+}
+
+//+------------------------------------------------------------------+
+//| Expert tick function                                             |
+//+------------------------------------------------------------------+
+void OnTick()
+{
+    // Reset daily values if day changed
+    if(IsDayChanged()) {
+        ResetDailyValues();
+    }
+
+    // Only proceed on new bar
+    if(!IsNewBar()) return;
+
+    // Update market analysis
+    UpdateMarketRegime();
+    UpdateMarketCycle();
+    UpdateSessionStatus();
+    UpdateMLFeatures();
+    UpdateGoldSpecificIndicators();
+
+    // Check if trading is allowed
+    if(!CheckTradeAllowed()) return;
+    
+    // Manage open positions
+    ManageOpenPositions();
+
+    // Don't open new positions if max positions reached
+    if(CountOpenPositions() >= MaxPositions) return;
+
+    // Get trading signals
+    double buy_signal = GetMLSignal(OP_BUY) * BuySignalMultiplier;
+    double sell_signal = GetMLSignal(OP_SELL) * SellSignalMultiplier;
+
+    // Execute trades if signals are strong enough
+    if(buy_signal > MLConfidenceThreshold && AllowBuyTrades) {
+        PrintFormat("Opening BUY trade with signal strength: %.4f", buy_signal);
+        ExecuteMarketOrder(OP_BUY);
+    }
+    else if(sell_signal > MLConfidenceThreshold && AllowSellTrades) {
+        PrintFormat("Opening SELL trade with signal strength: %.4f", sell_signal);
+        ExecuteMarketOrder(OP_SELL);
+    }
+}
+
+//+------------------------------------------------------------------+
+//| Calculate proper position size for XAUUSD                        |
+//+------------------------------------------------------------------+
+double CalculatePositionSize(double stop_distance)
+{
+    if(stop_distance <= 0) return 0;
+
+    double account_balance = AccountBalance();
+    double margin_required = MarketInfo(Symbol(), MODE_MARGINREQUIRED);
+    double tick_value = MarketInfo(Symbol(), MODE_TICKVALUE);
+    double min_lot = MarketInfo(Symbol(), MODE_MINLOT);
+    double max_lot = MarketInfo(Symbol(), MODE_MAXLOT);
+    double lot_step = MarketInfo(Symbol(), MODE_LOTSTEP);
+
+    // Calculate risk amount based on account balance
+    double risk_amount = account_balance * (RiskPercent / 100.0);
+    
+    // Adjust risk based on market conditions
+    if(g_market_regime == REGIME_VOLATILE) {
+        risk_amount *= 0.8; // Reduce risk in volatile markets
+    }
+    
+    // Calculate lots based on risk and stop distance
+    double risk_lots = risk_amount / (stop_distance * tick_value);
+    double max_leverage_lots = AccountFreeMargin() / margin_required;
+
+    // Calculate maximum allowed lots based on account size
+    double max_allowed_lots = MAX_INITIAL_LOTS;
+    if(account_balance > INITIAL_BALANCE) {
+        max_allowed_lots = MAX_INITIAL_LOTS * 
+            (1 + (account_balance - INITIAL_BALANCE) / INITIAL_BALANCE) * 0.2;
+    }
+
+    // Find the minimum of all lot constraints
+    double final_lots = MathMin(risk_lots, max_leverage_lots);
+    final_lots = MathMin(final_lots, max_allowed_lots);
+    final_lots = NormalizeDouble(MathFloor(final_lots / lot_step) * lot_step, 2);
+    final_lots = MathMax(final_lots, min_lot);
+    final_lots = MathMin(final_lots, max_lot);
+
+    // Final safety check for margin requirements
+    if(final_lots * margin_required > AccountFreeMargin() * 0.8) {
+        Print("Warning: Required margin would exceed 80% of free margin");
+        return 0;
+    }
+
+    return final_lots;
+}
+
+//+------------------------------------------------------------------+
+//| Execute market order with proper risk management                 |
+//+------------------------------------------------------------------+
+void ExecuteMarketOrder(int cmd)
+{
+    if(!CheckTradeAllowed()) return;
+
+    // Get entry price based on order type
+    double entry_price = (cmd == OP_BUY) ? Ask : Bid;
+    double sl = CalculateStopLoss(cmd, entry_price);
+    double tp = CalculateTakeProfit(cmd, entry_price);
+    double lots = CalculatePositionSize(MathAbs(entry_price - sl));
+
+    // Validate lot size
+    if(lots == 0) {
+        Print("Invalid lot size calculated");
+        return;
+    }
+
+    // Check margin requirements
+    double margin_needed = MarketInfo(Symbol(), MODE_MARGINREQUIRED) * lots;
+    if(margin_needed > AccountFreeMargin() * 0.8) {
+        Print("Insufficient margin for trade. Required: ", margin_needed,
+              " Available: ", AccountFreeMargin());
+        return;
+    }
+
+    int ticket = -1;
+    
+    // Handle multiple take profit levels if enabled
+    if(UseMultipleTPs && lots >= MarketInfo(Symbol(), MODE_MINLOT) * 3) {
+        // Split the position into multiple parts with different TPs
+        double lots1 = NormalizeDouble(lots * (TP1Percent / 100.0), 2);
+        double lots2 = NormalizeDouble(lots * (TP2Percent / 100.0), 2);
+        double lots3 = NormalizeDouble(lots - lots1 - lots2, 2);
+        
+        // Calculate multiple TPs
+        double tp1 = CalculatePartialTP(cmd, entry_price, TP1Ratio);
+        double tp2 = CalculatePartialTP(cmd, entry_price, TP2Ratio);
+        double tp3 = CalculatePartialTP(cmd, entry_price, TP3Ratio);
+        
+        // Open positions with different TPs
+        if(lots1 >= MarketInfo(Symbol(), MODE_MINLOT)) {
+            int ticket1 = OrderSend(Symbol(), cmd, lots1, entry_price, 3, sl, tp1,
+                                  EA_NAME + "-TP1", MAGIC_NUMBER, 0, cmd == OP_BUY ? clrBlue : clrRed);
+            if(ticket1 > 0) ticket = ticket1;
+        }
+        
+        if(lots2 >= MarketInfo(Symbol(), MODE_MINLOT)) {
+            int ticket2 = OrderSend(Symbol(), cmd, lots2, entry_price, 3, sl, tp2,
+                                  EA_NAME + "-TP2", MAGIC_NUMBER, 0, cmd == OP_BUY ? clrBlue : clrRed);
+            if(ticket2 > 0 && ticket < 0) ticket = ticket2;
+        }
+        
+        if(lots3 >= MarketInfo(Symbol(), MODE_MINLOT)) {
+            int ticket3 = OrderSend(Symbol(), cmd, lots3, entry_price, 3, sl, tp3,
+                                  EA_NAME + "-TP3", MAGIC_NUMBER, 0, cmd == OP_BUY ? clrBlue : clrRed);
+            if(ticket3 > 0 && ticket < 0) ticket = ticket3;
+        }
+    }
+    else {
+        // Standard single TP approach
+        ticket = OrderSend(Symbol(), cmd, lots, entry_price, 3, sl, tp,
+                          EA_NAME, MAGIC_NUMBER, 0, cmd == OP_BUY ? clrBlue : clrRed);
+    }
+
+    if(ticket > 0) {
+        // Trade executed successfully
+        g_last_trade_time = TimeCurrent();
+        g_daily_risk_used += RiskPercent;
+        LogTradeExecution(cmd, lots, entry_price, sl, tp);
+        if (EnableMLAdaptation) AdaptMLWeights(cmd, 1.0);  // Learning success
+    }
+    else {
+        // Trade failed
+        Print("Order failed. Error: ", GetLastError());
+        if (EnableMLAdaptation) AdaptMLWeights(cmd, 0.0);  // Learning fail
+    }
+}
+
+//+------------------------------------------------------------------+
+//| SL/TP Calculation                                                |
+//+------------------------------------------------------------------+
+double CalculateStopLoss(int cmd, double entry_price)
+{
+    // Calculate ATR for dynamic stop loss sizing
+    double atr = iATR(Symbol(), PrimaryTimeframe, 14, 0);
+    g_last_atr = atr;
+
+    // Base stop loss distance on ATR
+    double sl_distance = atr * 1.2; // Reduced from 1.5 for tighter stops
+
+    // Adjust stop loss based on market regime
+    switch(g_market_regime) {
+        case REGIME_VOLATILE: 
+            sl_distance *= 1.3; // Reduced from 1.5
+            break;
+        case REGIME_RANGING: 
+            sl_distance *= 0.8; 
+            break;
+        case REGIME_TRENDING_UP:
+        case REGIME_TRENDING_DOWN:
+            sl_distance *= 1.0; // Standard for trending markets
+            break;
+    }
+    
+    // Additional adjustment based on gold-specific indicators
+    if(g_usd_index_correlation > 0.7) {
+        sl_distance *= 1.1; // Increase SL for high USD correlation
+    }
+    
+    // Calculate final stop loss price
+    return (cmd == OP_BUY) ? entry_price - sl_distance : entry_price + sl_distance;
+}
+
+double CalculateTakeProfit(int cmd, double entry_price)
+{
+    // Get stop loss level
+    double sl = CalculateStopLoss(cmd, entry_price);
+    double sl_distance = MathAbs(entry_price - sl);
+    
+    // Use a more conservative TP:SL ratio of 1.2 (reduced from 1.5)
+    double tp_distance = sl_distance * 1.2;
+
+    // Adjust TP distance based on market regime
+    switch(g_market_regime) {
+        case REGIME_TRENDING_UP:
+        case REGIME_TRENDING_DOWN:
+            tp_distance *= 1.5; // Reduced from 2.0
+            break;
+        case REGIME_RANGING:
+            tp_distance *= 1.2;
+            break;
+        case REGIME_VOLATILE:
+            tp_distance *= 1.3; // Added for volatile markets
+            break;
+    }
+    
+    // Adjust TP based on market cycle
+    switch(g_market_cycle) {
+        case CYCLE_MARKUP:
+            if(cmd == OP_BUY) tp_distance *= 1.1;
+            break;
+        case CYCLE_MARKDOWN:
+            if(cmd == OP_SELL) tp_distance *= 1.1;
+            break;
+    }
+
+    // Calculate final take profit price
+    return (cmd == OP_BUY) ? entry_price + tp_distance : entry_price - tp_distance;
+}
+
+//+------------------------------------------------------------------+
+//| Calculate partial take profit levels                             |
+//+------------------------------------------------------------------+
+double CalculatePartialTP(int cmd, double entry_price, double tp_ratio)
+{
+    double sl = CalculateStopLoss(cmd, entry_price);
+    double sl_distance = MathAbs(entry_price - sl);
+    double tp_distance = sl_distance * tp_ratio;
+    
+    return (cmd == OP_BUY) ? entry_price + tp_distance : entry_price - tp_distance;
+}
+
+//+------------------------------------------------------------------+
+//| Manage Open Positions                                            |
+//+------------------------------------------------------------------+
+void ManageOpenPositions()
+{
+    for(int i = OrdersTotal() - 1; i >= 0; i--)
+    {
+        if(!OrderSelect(i, SELECT_BY_POS, MODE_TRADES)) continue;
+        if(OrderSymbol() != Symbol() || OrderMagicNumber() != MAGIC_NUMBER) continue;
+
+        bool modified = false;
+
+        // Break even management
+        if(UseBreakEven) modified = ManageBreakEven(OrderTicket());
+        
+        // Trailing stop management
+        if(UseTrailingStop && !modified) ManageTrailingStop(OrderTicket());
+    }
+}
+
+//+------------------------------------------------------------------+
+//| Trade management functions                                       |
+//+------------------------------------------------------------------+
+bool ManageBreakEven(int ticket)
+{
+    if(!OrderSelect(ticket, SELECT_BY_TICKET)) return false;
+
+    // Break even activation and profit levels
+    double be_level = g_last_atr * BreakEvenActivation;
+    double be_profit = g_last_atr * BreakEvenProfit;
+
+    // Move stop loss to break even + profit for BUY orders
+    if(OrderType() == OP_BUY &&
+       Bid >= OrderOpenPrice() + be_level &&
+       OrderStopLoss() < OrderOpenPrice() + be_profit)
+    {
+        return OrderModify(ticket, OrderOpenPrice(), OrderOpenPrice() + be_profit,
+                           OrderTakeProfit(), 0, clrBlue);
+    }
+    // Move stop loss to break even + profit for SELL orders
+    else if(OrderType() == OP_SELL &&
+            Ask <= OrderOpenPrice() - be_level &&
+            OrderStopLoss() > OrderOpenPrice() - be_profit)
+    {
+        return OrderModify(ticket, OrderOpenPrice(), OrderOpenPrice() - be_profit,
+                           OrderTakeProfit(), 0, clrRed);
+    }
+
+    return false;
+}
+
+bool ManageTrailingStop(int ticket)
+{
+    if(!OrderSelect(ticket, SELECT_BY_TICKET)) return false;
+
+    // Trailing stop activation and distance
+    double trail_level = g_last_atr * TrailingActivation;
+    double trail_distance = g_last_atr * TrailingDistance;
+
+    // Adjust trailing stop for BUY orders
+    if(OrderType() == OP_BUY)
+    {
+        double new_sl = Bid - trail_distance;
+        if(Bid >= OrderOpenPrice() + trail_level &&
+           (OrderStopLoss() < new_sl || OrderStopLoss() == 0))
+        {
+            return OrderModify(ticket, OrderOpenPrice(), new_sl, OrderTakeProfit(), 0, clrBlue);
+        }
+    }
+    // Adjust trailing stop for SELL orders
+    else if(OrderType() == OP_SELL)
+    {
+        double new_sl = Ask + trail_distance;
+        if(Ask <= OrderOpenPrice() - trail_level &&
+           (OrderStopLoss() > new_sl || OrderStopLoss() == 0))
+        {
+            return OrderModify(ticket, OrderOpenPrice(), new_sl, OrderTakeProfit(), 0, clrRed);
+        }
+    }
+
+    return false;
+}
+
+//+------------------------------------------------------------------+
+//| Market analysis functions                                        |
+//+------------------------------------------------------------------+
+void UpdateMarketRegime()
+{
+    // Calculate moving averages for trend detection
+    double ma_fast = iMA(Symbol(), PrimaryTimeframe, 20, 0, MODE_EMA, PRICE_CLOSE, 0);
+    double ma_slow = iMA(Symbol(), PrimaryTimeframe, 50, 0, MODE_EMA, PRICE_CLOSE, 0);
+    double ma_long = iMA(Symbol(), LongTermTimeframe, 100, 0, MODE_EMA, PRICE_CLOSE, 0);
+    
+    // Calculate ATR for volatility measurement
+    double atr = iATR(Symbol(), PrimaryTimeframe, 14, 0);
+    double atr_avg = 0;
+
+    // Average ATR over 14 periods
+    for(int i = 0; i < 14; i++) {
+        atr_avg += iATR(Symbol(), PrimaryTimeframe, 14, i);
+    }
+    atr_avg /= 14;
+
+    // Calculate volatility index and trend strength
+    double volatility_index = atr / atr_avg;
+    double trend_strength = MathAbs(ma_fast - ma_slow) / Point;
+    double long_term_trend = (ma_slow > ma_long) ? 1.0 : -1.0;
+
+    // Determine market regime
+    if(volatility_index > 1.4) { // Reduced from 1.5
+        g_market_regime = REGIME_VOLATILE;
+    }
+    else if(trend_strength > 85) { // Reduced from 100
+        g_market_regime = (ma_fast > ma_slow) ? REGIME_TRENDING_UP : REGIME_TRENDING_DOWN;
+    }
+    else {
+        g_market_regime = REGIME_RANGING;
+    }
+
+    // Calculate regime strength
+    g_regime_strength = trend_strength * volatility_index * long_term_trend;
+}
+
+void UpdateMarketCycle()
+{
+    // Calculate momentum and volume indicators
+    double momentum = iMomentum(Symbol(), PrimaryTimeframe, 14, PRICE_CLOSE, 0);
+    double volume = iVolume(Symbol(), PrimaryTimeframe, 0);
+    double avg_volume = 0;
+    double max_volume = 0;
+
+    // Calculate average and maximum volume
+    for(int i = 1; i <= 20; i++) {
+        double vol = iVolume(Symbol(), PrimaryTimeframe, i);
+        avg_volume += vol;
+        max_volume = MathMax(max_volume, vol);
+    }
+    avg_volume /= 20;
+
+    // Determine market cycle based on momentum and volume
+    if(momentum < 100 && volume > avg_volume) {
+        g_market_cycle = CYCLE_ACCUMULATION;
+    }
+    else if(momentum > 100 && volume > avg_volume * 1.2) { // Added 20% threshold
+        g_market_cycle = CYCLE_MARKUP;
+    }
+    else if(momentum > 100 && volume < avg_volume) {
+        g_market_cycle = CYCLE_DISTRIBUTION;
+    }
+    else {
+        g_market_cycle = CYCLE_MARKDOWN;
+    }
+
+    // Calculate cycle progress
+    g_cycle_progress = (volume / max_volume) * 100;
+}
+
+//+------------------------------------------------------------------+
+//| Update session status for trading hour filter                    |
+//+------------------------------------------------------------------+
+void UpdateSessionStatus()
+{
+    int current_hour = TimeHour(TimeCurrent());
+    
+    bool asian_session = (current_hour >= 0 && current_hour < 8);
+    bool london_session = (current_hour >= 8 && current_hour < 16);
+    bool newyork_session = (current_hour >= 13 && current_hour < 21);
+    
+    // US-Asian overlap is most volatile for gold
+    bool us_asian_overlap = (current_hour >= 0 && current_hour < 3) || 
+                            (current_hour >= 19 && current_hour < 24);
+    
+    g_in_optimal_session = false;
+    
+    if(FilterBySession) {
+        // Check if current session is allowed
+        if((asian_session && TradeAsianSession) ||
+           (london_session && TradeLondonSession) ||
+           (newyork_session && TradeNewYorkSession)) {
+            g_in_optimal_session = true;
+        }
+        
+        // Prioritize US-Asian overlap if enabled
+        if(PrioritizeUSAsianOverlap && us_asian_overlap) {
+            g_in_optimal_session = true;
+        }
+    }
+    else {
+        g_in_optimal_session = true; // Session filter disabled
+    }
+}
+
+//+------------------------------------------------------------------+
+//| Update gold-specific market indicators                           |
+//+------------------------------------------------------------------+
+void UpdateGoldSpecificIndicators()
+{
+    // USD index correlation (simulated - would need external data source)
+    if(UseUSDCorrelation) {
+        double xau_change = (Close[0] - Close[5]) / Close[5];
+        // Negative correlation: When USD up, gold typically down
+        g_usd_index_correlation = -0.6 - 0.2 * xau_change; 
+        g_usd_index_correlation = MathMax(-1.0, MathMin(1.0, g_usd_index_correlation));
+    }
+    
+    // Equity market sentiment (simulated - would need external data source)
+    if(UseEquityMarketSentiment) {
+        double rsi = iRSI(Symbol(), PERIOD_H4, 14, PRICE_CLOSE, 0);
+        // When RSI high, market sentiment is risk-on, often negative for gold
+        g_equity_sentiment = (rsi - 50) / 50;
+    }
+    
+    // Volume profiling (simplified version)
+    if(UseVolumeProfiling) {
+        double high_volume_level = iHigh(Symbol(), PERIOD_D1, iHighest(Symbol(), PERIOD_D1, MODE_HIGH, 20, 0));
+        double low_volume_level = iLow(Symbol(), PERIOD_D1, iLowest(Symbol(), PERIOD_D1, MODE_LOW, 20, 0));
+        double current_price = Close[0];
+        
+        // Calculate where current price is within the range
+        g_volume_profile = (current_price - low_volume_level) / (high_volume_level - low_volume_level);
+    }
+}
+
+void UpdateMLFeatures()
+{
+    // Shift existing feature data
+    for(int i = MLWindowSize-1; i > 0; i--) {
+        for(int j = 0; j < MLFeatureCount; j++) {
+            g_ml_features[i][j] = g_ml_features[i-1][j];
+        }
+    }
+
+    // Original features (improved)
+    g_ml_features[0][0] = NormalizeValue(iMACD(Symbol(), PrimaryTimeframe, 12, 26, 9, PRICE_CLOSE, MODE_MAIN, 0));
+    g_ml_features[0][1] = NormalizeValue(iRSI(Symbol(), PrimaryTimeframe, 14, PRICE_CLOSE, 0));
+    g_ml_features[0][2] = NormalizeValue(iStochastic(Symbol(), PrimaryTimeframe, 5, 3, 3, MODE_SMA, 0, MODE_MAIN, 0));
+    g_ml_features[0][3] = NormalizeValue(g_regime_strength);
+    g_ml_features[0][4] = (double)g_market_regime / 3.0;
+    g_ml_features[0][5] = (double)g_market_cycle / 3.0;
+    g_ml_features[0][6] = g_cycle_progress / 100.0;
+    g_ml_features[0][7] = NormalizeValue(iATR(Symbol(), PrimaryTimeframe, 14, 0) / Point);
+    g_ml_features[0][8] = (Close[0] - iLow(Symbol(), PrimaryTimeframe, iLowest(Symbol(), PrimaryTimeframe, MODE_LOW, 20, 0))) /
+                          (iHigh(Symbol(), PrimaryTimeframe, iHighest(Symbol(), PrimaryTimeframe, MODE_HIGH, 20, 0)) - 
+                           iLow(Symbol(), PrimaryTimeframe, iLowest(Symbol(), PrimaryTimeframe, MODE_LOW, 20, 0)));
+    g_ml_features[0][9] = NormalizeValue(iMomentum(Symbol(), PrimaryTimeframe, 14, PRICE_CLOSE, 0));
+    
+    // Additional features (new)
+    g_ml_features[0][10] = g_in_optimal_session ? 1.0 : 0.0;
+    g_ml_features[0][11] = NormalizeValue(g_usd_index_correlation);
+    g_ml_features[0][12] = NormalizeValue(g_equity_sentiment);
+    g_ml_features[0][13] = NormalizeValue(g_volume_profile);
+    
+    // Trend alignment feature
+    double h1_trend = iMA(Symbol(), PERIOD_H1, 20, 0, MODE_EMA, PRICE_CLOSE, 0) -
+                      iMA(Symbol(), PERIOD_H1, 50, 0, MODE_EMA, PRICE_CLOSE, 0);
+    double h4_trend = iMA(Symbol(), PERIOD_H4, 20, 0, MODE_EMA, PRICE_CLOSE, 0) -
+                      iMA(Symbol(), PERIOD_H4, 50, 0, MODE_EMA, PRICE_CLOSE, 0);
+    
+    g_ml_features[0][14] = (h1_trend * h4_trend > 0) ? 1.0 : -0.5; // Aligned vs. conflicting trends
+}
+
+//+------------------------------------------------------------------+
